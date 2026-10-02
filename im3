@@ -30,7 +30,7 @@ APP_VERSION = "82.2.0"
 CHANNEL = "PORTAL"
 PROJECT = "myim3"
 RC4_KEY = b"Ind0s@t001!"
-VERSION = "0.4"
+VERSION = "0.5"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 STATE_DIR = os.path.expanduser("~/.im3-cli")
@@ -363,6 +363,135 @@ def save_config(cfg):
     with open(p, "w") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
     os.chmod(p, 0o600)
+
+
+# --------------------------------------------------------------------------- update
+
+REPO_RAW = "https://raw.githubusercontent.com/Agus38/im3-cli/main/im3"
+UPDATE_TTL = 6 * 3600
+
+
+def parse_version(v):
+    nums = tuple(int(x) for x in re.findall(r"\d+", str(v or "")))
+    return nums or (0,)
+
+
+def is_newer(remote, local):
+    return parse_version(remote) > parse_version(local)
+
+
+def remote_version(src):
+    m = re.search(r'^VERSION\s*=\s*["\']([^"\']+)["\']', str(src or ""), re.M)
+    return m.group(1) if m else None
+
+
+def fetch_remote_source(timeout=8):
+    r = requests.get(REPO_RAW, timeout=timeout,
+                     headers={"User-Agent": f"im3-cli/{VERSION}"})
+    r.raise_for_status()
+    return r.text
+
+
+def load_update_cache():
+    p = state_path("update-check.json")
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_update_cache(cache):
+    p = state_path("update-check.json")
+    with open(p, "w") as f:
+        json.dump(cache, f)
+    os.chmod(p, 0o600)
+
+
+def check_forced_update():
+    """Versi remote bila user wajib update, selain None.
+
+    Gagal cek (offline, limit) tidak memblokir — fail-open.
+    """
+    if os.environ.get("IM3_NO_UPDATE_CHECK"):
+        return None
+    cache = load_update_cache()
+    now = time.time()
+    remote = cache.get("remote_version")
+    if not remote or now - float(cache.get("checked_at") or 0) > UPDATE_TTL:
+        try:
+            src = fetch_remote_source()
+        except requests.RequestException:
+            return None
+        remote = remote_version(src)
+        save_update_cache({"checked_at": now, "remote_version": remote or ""})
+        if not remote:
+            return None
+    return remote if is_newer(remote, VERSION) else None
+
+
+def enforce_update():
+    remote = check_forced_update()
+    if not remote:
+        return
+    print()
+    print(warn_msg(f"versi terbaru tersedia: v{remote} (terpasang: v{VERSION})"))
+    print(err_msg("perbarui dulu untuk melanjutkan:  im3 update"))
+    print(hint("lewati sekali: IM3_NO_UPDATE_CHECK=1 im3 <perintah>"))
+    sys.exit(3)
+
+
+def update_target():
+    try:
+        exe = os.path.realpath(sys.argv[0])
+    except (OSError, ValueError, IndexError):
+        exe = ""
+    return exe if exe and os.path.isfile(exe) else None
+
+
+def cmd_update(target=None):
+    target = target or update_target()
+    if not target:
+        die("tidak bisa menentukan lokasi binary im3 — perbarui manual dengan "
+            "installer di README")
+    try:
+        with Loader("Mengunduh versi terbaru"):
+            src = fetch_remote_source(timeout=25)
+    except requests.RequestException as e:
+        die(f"gagal mengunduh versi terbaru: {e}")
+    remote = remote_version(src)
+    if not remote:
+        die("file unduhan tidak valid (VERSION tidak ditemukan)")
+
+    if os.path.isdir(os.path.join(os.path.dirname(target), ".git")):
+        print(warn_msg("lokasi ini clone git — perbarui dengan: git pull"))
+        return
+
+    if not is_newer(remote, VERSION):
+        save_update_cache({"checked_at": time.time(), "remote_version": remote})
+        print(ok_msg(f"sudah versi terbaru (v{VERSION})"))
+        return
+
+    if not os.access(target, os.W_OK):
+        alt_dir = os.path.join(os.path.expanduser("~"), ".local", "bin")
+        alt = os.path.join(alt_dir, "im3")
+        try:
+            os.makedirs(alt_dir, exist_ok=True)
+        except OSError:
+            die(f"tidak ada izin menulis {target} dan {alt_dir} tidak bisa dibuat")
+        print(warn_msg(f"tidak ada izin menulis {target}"))
+        print(hint(f"dipasang ke {alt} — pastikan folder ini di PATH sebelum "
+                   f"{os.path.dirname(target)}"))
+        target = alt
+
+    tmp = target + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(src)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, target)
+    save_update_cache({"checked_at": time.time(), "remote_version": remote})
+    print(ok_msg(f"berhasil diperbarui: v{VERSION} → v{remote}"))
+    print(hint("verifikasi: im3 --version  ·  lalu jalankan ulang perintah Anda"))
 
 
 # --------------------------------------------------------------------------- ui
@@ -1846,6 +1975,7 @@ def main():
     se.add_argument("--pay", action="store_true", help="lakukan pembayaran")
     se.add_argument("--yes", action="store_true", help="lewati konfirmasi token")
     sub.add_parser("userdata", help="pemakaian, langganan (VAS), info pelanggan")
+    sub.add_parser("update", help="perbarui ke versi terbaru")
     by = sub.add_parser("buy", help="beli paket; default dry-run (hanya quote)")
     by.add_argument("pvr_code", nargs="?", default="",
                     help="kode pvr_code, ada di layar detail paket")
@@ -1883,8 +2013,15 @@ def main():
                    help="kirim pesan uji ke Telegram lalu keluar")
     args = p.parse_args()
 
+    if args.cmd != "update":
+        enforce_update()
+
     if not args.cmd:
         interactive()
+        return
+
+    if args.cmd == "update":
+        cmd_update()
         return
 
     if args.cmd == "login":

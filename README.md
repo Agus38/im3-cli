@@ -62,7 +62,23 @@ im3 watch      # pantau saldo, kuota, masa aktif
 | `im3 packlist` / `im3 search` | katalog & pencarian paket          |
 | `im3 buy <kode>`     | beli paket (default hanya simulasi)       |
 | `im3 watch`          | pantau + peringatan                       |
+| `im3 update`         | perbarui ke versi terbaru                 |
 | `im3 raw`            | panggil endpoint API (tingkat lanjut)     |
+
+## Pembaruan
+
+`im3` memeriksa versi terbaru secara berkala (maksimal tiap 6 jam). Jika ada
+versi baru, **semua perintah diblokir** sampai Anda memperbarui:
+
+```sh
+im3 update
+```
+
+Lewati pemeriksaan satu kali (mis. offline atau pengembang):
+
+```sh
+IM3_NO_UPDATE_CHECK=1 im3 balance
+```
 
 ## watch — pemantauan & peringatan
 

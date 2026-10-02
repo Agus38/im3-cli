@@ -3,6 +3,18 @@
 Format mengikuti [Keep a Changelog](https://keepachangelog.com). **Setiap update
 yang dirilis wajib bump versi di `VERSION` (dalam script `im3`) dan dicatat di sini.**
 
+## 0.5 — 2026-10-02
+
+### Ditambahkan
+- **Paksa update**: setiap perintah memeriksa versi terbaru (maks. tiap 6 jam,
+  hasil cache di state lokal). Bila versi remote lebih baru, perintah diblokir
+  sampai user menjalankan `im3 update`. Gagal cek (offline/blokir jaringan)
+  tidak memblokir (fail-open).
+- `im3 update` — unduh versi terbaru dan timpa binary yang terpasang; otomatis
+  fallback ke `~/.local/bin` bila tidak punya izin tulis; bila lokasi adalah
+  clone git, disarankan `git pull`.
+- Lewati satu kali (developer/offline): `IM3_NO_UPDATE_CHECK=1`.
+
 ## 0.4 — 2026-10-02
 
 ### Ditambahkan
