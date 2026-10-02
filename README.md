@@ -43,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/Agus38/im3-cli/main/install.sh | sh
 ```sh
 im3            # menu interaktif (paling mudah untuk pemula)
 im3 login      # login sekali dengan OTP
-im3 balance    # cek saldo & masa aktif
+im3 balance    # saldo, masa aktif, registrasi & lama bergabung
 im3 packages   # paket aktif + sisa kuota
 im3 watch      # pantau saldo, kuota, masa aktif
 ```
@@ -54,7 +54,7 @@ im3 watch      # pantau saldo, kuota, masa aktif
 |----------------------|-------------------------------------------|
 | `im3`                | menu interaktif                           |
 | `im3 login` / `logout` | masuk / keluar sesi                     |
-| `im3 balance`        | saldo & masa aktif                         |
+| `im3 balance`        | saldo, masa aktif, registrasi & lama bergabung |
 | `im3 packages`       | paket aktif + sisa kuota                   |
 | `im3 profile`        | profil pelanggan                          |
 | `im3 transactions`   | riwayat transaksi                         |

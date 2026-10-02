@@ -30,7 +30,7 @@ APP_VERSION = "82.2.0"
 CHANNEL = "PORTAL"
 PROJECT = "myim3"
 RC4_KEY = b"Ind0s@t001!"
-VERSION = "0.3"
+VERSION = "0.4"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 STATE_DIR = os.path.expanduser("~/.im3-cli")
@@ -621,7 +621,7 @@ def fmt_msisdn(m):
 
 
 MENU_ITEMS = [
-    ("1", "Saldo & masa aktif"),
+    ("1", "Saldo, masa aktif & registrasi"),
     ("2", "Paket aktif"),
     ("3", "Profil"),
     ("4", "Riwayat transaksi"),
@@ -1238,6 +1238,61 @@ def cmd_buy(c, pvr="", pay=False, yes=False, dry_run=False):
     run_buy(c, pkg, yes=yes, dry_run=dry_run or not pay)
 
 
+def registration_info(c, dash):
+    """(teks tanggal, date|None, sumber) untuk info registrasi user.
+
+    Sumber utama: prepaidinfo.usersince dari /customerprofile/get — field yang
+    sama dengan label "Pengguna Sejak" di app myIM3. Cadangan: awal paket utama
+    di dashboard (StartDate), karena field resmi tidak selalu tersedia.
+    """
+    prof = {}
+    try:
+        prof = fetch(c, "/customerprofile/get", what="info registrasi",
+                     msg="Mengambil info registrasi")
+    except SystemExit:
+        prof = {}
+    pi = prof.get("prepaidinfo") or {} if isinstance(prof, dict) else {}
+    raw = pi.get("usersince")
+    if raw:
+        return str(raw), parse_date(raw), "app"
+
+    starts = []
+    for p in (dash.get("packdata") or {}).get("packageslist") or []:
+        dt = parse_date(p.get("StartDate"))
+        if not dt:
+            continue
+        if str(p.get("ServiceType") or "").lower() == "main package":
+            return fmt_date(dt), dt, "package"
+        starts.append(dt)
+    if starts:
+        dt = min(starts)
+        return fmt_date(dt), dt, "package"
+    return "", None, ""
+
+
+def fmt_date(d):
+    return f"{d.day} {BULAN[d.month - 1]} {d.year}"
+
+
+def fmt_duration(d, now=None):
+    if not d:
+        return None
+    now = now or datetime.datetime.now()
+    if d.date() > now.date():
+        return None
+    months = (now.year - d.year) * 12 + (now.month - d.month) \
+        - (1 if now.day < d.day else 0)
+    years, months = divmod(months, 12)
+    parts = []
+    if years:
+        parts.append(f"{years} tahun")
+    if months:
+        parts.append(f"{months} bulan")
+    if not parts:
+        parts.append(f"{max((now.date() - d.date()).days, 0)} hari")
+    return " ".join(parts)
+
+
 def cmd_balance(c):
     d = fetch(c, "/dashboard/get/v4", what="saldo", msg="Mengambil saldo")
     info_ = d.get("prepaidinfo", {})
@@ -1249,8 +1304,17 @@ def cmd_balance(c):
         rows.append(("Tenggang", info_["graceperioduntil"]))
     for k, v in list((d.get("impoints") or {}).items())[:4]:
         rows.append((str(k).replace("_", " ").title(), str(v)))
+    reg_text, reg_date, reg_src = registration_info(c, d)
+    if reg_text:
+        rows.append(("Registrasi", reg_text))
+        dur = fmt_duration(reg_date)
+        if dur:
+            rows.append(("Bergabung", accent(dur)))
     print(card("SALDO", rows=rows, right=fmt_msisdn(c.msisdn),
                right_style=lambda t: accent(t)))
+    if reg_src == "package":
+        print(hint("tanggal registrasi diambil dari awal paket utama; "
+                   "field resmi 'pengguna sejak' tidak tersedia untuk nomor ini"))
 
 
 def _print_packages(d):
@@ -1485,7 +1549,8 @@ def cmd_raw(c, path, body):
 # ------------------------------------------------------------------------ watch
 
 DATE_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y",
-                "%d-%m-%Y", "%d%m%Y", "%Y%m%d", "%d %b %Y", "%d %B %Y")
+                "%d-%m-%Y", "%d.%m.%Y", "%d.%m.%y", "%d%m%Y", "%Y%m%d",
+                "%d %b %Y", "%d %B %Y", "%b %d %Y", "%B %d %Y")
 
 
 def parse_date(s):

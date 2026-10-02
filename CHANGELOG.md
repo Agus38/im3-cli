@@ -3,6 +3,14 @@
 Format mengikuti [Keep a Changelog](https://keepachangelog.com). **Setiap update
 yang dirilis wajib bump versi di `VERSION` (dalam script `im3`) dan dicatat di sini.**
 
+## 0.4 — 2026-10-02
+
+### Ditambahkan
+- Menu 1 (`im3 balance`) kini menampilkan **tanggal registrasi** dan **lama
+  bergabung** (mis. `8 tahun 6 bulan`) selain saldo, masa aktif, dan tenggang.
+- Sumber tanggal: field "pengguna sejak" dari info pelanggan; cadangan: awal
+  paket utama dari dashboard (dicatat di layar bila dipakai).
+
 ## 0.3 — 2026-10-02
 
 ### Ditambahkan
