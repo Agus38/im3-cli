@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# rahasia lokal — jangan pernah masuk repo
+session.json
+config.json
+watch-state.json
+purchases.jsonl
+.env

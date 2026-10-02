@@ -1,0 +1,1856 @@
+#!/usr/bin/env python3
+"""IM3 CLI - unofficial myIM3 (Indosat Ooredoo) command line client.
+
+Reverse engineered from the public myIM3 PWA (myim3app.indosatooredoo.com).
+Only works against your own account. Unofficial - may break on app updates.
+"""
+
+import argparse
+import base64
+import datetime
+import hashlib
+import json
+import os
+import random
+import re
+import shutil
+import sys
+import threading
+import time
+import uuid
+
+import requests
+
+BASE = "https://myim3api1.ioh.co.id/api/v2"
+HE_URL = "https://myim3-he.indosatooredoo.com/api/v2/token/web/v2"
+
+HDR_AUTH = "642d1cc69d90666962726e"
+SERVICE_KEY = "i4WxFMMLvWqnrvuAyg58"
+APP_VERSION = "82.2.0"
+CHANNEL = "PORTAL"
+PROJECT = "myim3"
+RC4_KEY = b"Ind0s@t001!"
+VERSION = "0.2"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+STATE_DIR = os.path.expanduser("~/.im3-cli")
+
+
+# --------------------------------------------------------------------------- crypto
+
+
+def rc4(data: str) -> str:
+    s = list(range(256))
+    k = [RC4_KEY[i % len(RC4_KEY)] for i in range(256)]
+    j = 0
+    for i in range(256):
+        j = (j + s[i] + k[i]) % 256
+        s[i], s[j] = s[j], s[i]
+    out = bytearray()
+    i = j = 0
+    for ch in data.encode("latin-1"):
+        i = (i + 1) % 256
+        j = (j + s[i]) % 256
+        s[i], s[j] = s[j], s[i]
+        out.append(ch ^ s[(s[i] + s[j]) % 256])
+    return out.hex()
+
+
+def odd_chars(s: str) -> str:
+    return "".join(s[i] for i in range(0, len(s), 2))
+
+
+def sha512(payload: str) -> str:
+    return hashlib.sha512(payload.encode()).hexdigest()
+
+
+# --------------------------------------------------------------------------- utils
+
+
+def normalize_msisdn(raw: str) -> str:
+    """Return national format without country code, e.g. 62812... -> 812..."""
+    n = "".join(c for c in raw if c.isdigit())
+    if n.startswith("0"):
+        n = n[1:]
+    elif n.startswith("62"):
+        n = n[2:]
+    return n
+
+
+def die(msg, code=1):
+    print(f"   {err('✗')} {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+class Loader:
+    """Spinner shown while a network request is in flight."""
+
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, msg="Memuat"):
+        self.msg = msg
+        self._done = threading.Event()
+        self._thread = None
+
+    def _spin(self):
+        i = 0
+        start = time.time()
+        clear = 0
+        while not self._done.is_set():
+            frame = self.FRAMES[i % len(self.FRAMES)]
+            secs = int(time.time() - start)
+            plain = f"{frame} {self.msg}" + (f" ({secs}s)" if secs else "")
+            colored = accent(f"{frame} {self.msg}") + dim(f" ({secs}s)") if secs \
+                else accent(plain)
+            if clear:
+                sys.stdout.write("\r" + " " * clear + "\r")
+            sys.stdout.write(f"   {colored}")
+            sys.stdout.flush()
+            clear = len(plain) + 3
+            i += 1
+            self._done.wait(0.1)
+        if clear:
+            sys.stdout.write("\r" + " " * clear + "\r")
+            sys.stdout.flush()
+
+    def __enter__(self):
+        if sys.stdout.isatty():
+            self._thread = threading.Thread(target=self._spin, daemon=True)
+            self._thread.start()
+        else:
+            print(f"   {self.msg}...")
+        return self
+
+    def __exit__(self, *exc):
+        if self._thread:
+            self._done.set()
+            self._thread.join()
+        return False
+
+
+class Im3Client:
+    def __init__(self, msisdn=None, token=None, device=None):
+        # msisdn = national format without country code, e.g. 81234567890.
+        # The API expects the body msisdn with the 62 prefix (getValidMobileNumber
+        # in the PWA prepends COUNTRYCODE), while X-IMI-UID uses the local format.
+        self.msisdn = msisdn
+        self.msisdn_full = "62" + msisdn if msisdn else None
+        self.device = device or uuid.uuid4().hex
+        self.token = token
+        self.tid = None
+        if not self.token:
+            self.token, self.tid = self._guest_token()
+
+    def _guest_token(self):
+        tid = str(int(time.time() * 1000))
+        params = {
+            "X-IMI-TOKENID": "",
+            "X-IMI-CHANNEL": rc4(CHANNEL),
+            "X-IMI-LANGUAGE": rc4("ID"),
+            "tid": rc4(tid),
+            "X-IMI-App-OS": rc4("BROWSER"),
+            "pf": PROJECT,
+            "X-DEVICEID": rc4(self.device),
+        }
+        with Loader("Menghubungkan ke server"):
+            r = requests.get(HE_URL, params=params, headers={
+                "Origin": "https://myim3app.indosatooredoo.com",
+                "Referer": "https://myim3app.indosatooredoo.com/",
+                "User-Agent": UA,
+            }, timeout=30, allow_redirects=False)
+        loc = r.headers.get("location", "")
+        if "#/he/" not in loc:
+            raise RuntimeError(f"guest token failed: HTTP {r.status_code} {r.text[:200]}")
+        frag = loc.split("#/he/")[-1]
+        raw = base64.b64decode(frag + "=" * (-len(frag) % 4)).decode("utf-8", "replace")
+        session_id, jwt = raw.split("|")[:2]
+        return jwt, session_id
+
+    def _headers(self, body=None):
+        # The PWA's HTTP interceptor builds a per-request nonce and uses it as
+        # X-IMI-UID; X-IMI-HASH is salted with that nonce (not the token).
+        now = datetime.datetime.now()
+        nonce = now.strftime("%Y%m%d%H%M%S") + f"{now.microsecond // 1000:03d}" \
+            + str(random.randint(100, 999))
+        h = {
+            "Authorization": HDR_AUTH,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-IMI-App-OS": "BROWSER",
+            "X-IMI-APPVERSION": APP_VERSION,
+            "X-IMI-CHANNEL": CHANNEL,
+            "X-IMI-LANGUAGE": "ID",
+            "X-IMI-VERSION": APP_VERSION,
+            "X-IMI-SERVICEKEY": SERVICE_KEY,
+            "X-DEVICEID": self.device,
+            "X-DEVICENAME": "Chrome",
+            "X-IMI-TOKENID": self.token,
+            "X-IMI-UID": nonce,
+            "X-IMI-CHILD-LINENO": "",
+            "X-FAIID": "",
+            "Origin": "https://myim3app.indosatooredoo.com",
+            "Referer": "https://myim3app.indosatooredoo.com/",
+            "User-Agent": UA,
+        }
+        if body is not None:
+            raw = json.dumps(body, separators=(",", ":"))
+            h["x-imi-oauth"] = sha512(
+                f"REQBODY={raw}&SALT={odd_chars(self.token)}")
+        base = f"parent$BROWSER${APP_VERSION}${self.token}"
+        h["X-IMI-HASH"] = sha512(f"{base}&SALT={odd_chars(nonce)}")
+        return h
+
+    def post(self, path, body=None, retry=2):
+        body = body or {}
+        raw = json.dumps(body, separators=(",", ":"))
+        for attempt in range(retry + 1):
+            try:
+                r = requests.post(BASE + path, data=raw,
+                                  headers=self._headers(body), timeout=45)
+                break
+            except requests.RequestException as e:
+                if attempt < retry:
+                    time.sleep(1.0)
+                    continue
+                die(f"network error: {e}")
+        if os.environ.get("IM3_DEBUG"):
+            print(f"[debug] POST {path} -> HTTP {r.status_code} {r.text[:400]}",
+                  file=sys.stderr)
+        try:
+            return r.json()
+        except ValueError:
+            return {"status": "1", "message": f"HTTP {r.status_code}: {r.text[:300]}"}
+
+    def get(self, path):
+        try:
+            r = requests.get(BASE + path, headers=self._headers(None), timeout=45)
+            return r.json()
+        except (requests.RequestException, ValueError) as e:
+            return {"status": "1", "message": str(e)}
+
+
+def check(resp, what="request"):
+    if resp.get("status") != "0":
+        hint = ""
+        if resp.get("code") == "10005":
+            hint = ("\nhint: pastikan nomor aktif IM3 (prefix 0815/0816/0856/0857/0858), "
+                    "dan tulis tanpa '+' atau spasi.")
+        elif resp.get("code") == "10013":
+            hint = ("\nhint: OTP salah atau sudah kedaluwarsa (TTL 5 menit). "
+                    "Jalankan ulang `im3 login` untuk meminta OTP baru.")
+        elif resp.get("code") == "10012":
+            hint = ("\nhint: server menolak signature/header request. "
+                    "Biasanya karena versi app PWA berubah; cek APP_VERSION di script.")
+        elif resp.get("code") == "10021":
+            hint = ("\nhint: server minta jeda singkat (rate limit). "
+                    "Tunggu sebentar lalu jalankan ulang perintah.")
+        elif resp.get("code") == "90119":
+            hint = ("\nhint: layanan pembayaran sedang dalam pemeliharaan.")
+        elif resp.get("code") == "20188":
+            hint = "\nhint: belum ada paket pada kategori/parameter yang dipilih."
+        die(f"{what} failed [{resp.get('code')}]: {resp.get('message')}{hint}")
+    return resp
+
+
+# --------------------------------------------------------------------------- session
+
+
+def state_path(name):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    return os.path.join(STATE_DIR, name)
+
+
+def save_session(msisdn, token, device):
+    with open(state_path("session.json"), "w") as f:
+        json.dump({"msisdn": msisdn, "token": token, "device": device}, f)
+    os.chmod(state_path("session.json"), 0o600)
+
+
+def load_session():
+    p = state_path("session.json")
+    if not os.path.exists(p):
+        return None
+    with open(p) as f:
+        return json.load(f)
+
+
+def do_login(msisdn_arg=None):
+    try:
+        raw = msisdn_arg or input(f"   Nomor IM3 (mis. 81234567890) {accent('▸')} ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        die("input berakhir — butuh nomor IM3")
+    msisdn = normalize_msisdn(raw)
+    if len(msisdn) < 9 or not msisdn.startswith("8"):
+        die("nomor tidak valid (harus diawali 8, panjang 9-12 digit)")
+
+    c = Im3Client(msisdn=msisdn)
+    with Loader(f"Mengirim OTP ke +62{msisdn}"):
+        resp = c.post("/otp/send/v1", {"msisdn": c.msisdn_full, "action": "register"})
+    resp = check(resp, "kirim OTP")
+    print(f"   {ok('✓')} OTP terkirim ke {accent('+62' + msisdn)}")
+    candidates = []
+    for t in (resp.get("data", {}).get("transid"), resp.get("transid")):
+        if t and t not in candidates:
+            candidates.append(t)
+    if not candidates:
+        die(f"transid tidak ada di response: {json.dumps(resp)[:300]}")
+    for _ in range(3):
+        try:
+            otp = input(f"   Masukkan OTP (6 digit) {accent('▸')} ").strip().replace(" ", "")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            die("input berakhir — butuh kode OTP")
+        if otp.isdigit() and len(otp) == 6:
+            break
+        print(f"   {warn('!')} OTP harus 6 digit angka.")
+    else:
+        die("OTP tidak valid")
+
+    resp = None
+    for transid in candidates:
+        with Loader("Memverifikasi OTP"):
+            resp = c.post("/otp/validate/v1", {"transid": transid, "otp": otp})
+        if resp.get("status") == "0":
+            break
+        print(f"   {warn('!')} transid {dim(transid[:8])}... ditolak "
+              f"[{resp.get('code')}] — mencoba transid lain")
+    check(resp, "verifikasi OTP")
+    data = resp.get("data", {})
+    token = data.get("token") or data.get("tokenid")
+    if not token:
+        die(f"token tidak ada di response: {json.dumps(data)[:300]}")
+    save_session(msisdn, token, c.device)
+    print(f"   {ok('✓')} Login berhasil — sesi tersimpan di {dim(state_path('session.json'))}")
+    if str(data.get("newuser")).lower() == "true":
+        print(f"   {warn('!')} akun ini belum melengkapi profil di app myIM3.")
+    return c
+
+
+def get_client():
+    s = load_session()
+    if not s:
+        die("belum login. jalankan:  im3 login")
+    return Im3Client(msisdn=s["msisdn"], token=s["token"], device=s["device"])
+
+
+def get_client_optional():
+    s = load_session()
+    if not s:
+        return None
+    return Im3Client(msisdn=s["msisdn"], token=s["token"], device=s["device"])
+
+
+def logout():
+    p = state_path("session.json")
+    if os.path.exists(p):
+        os.remove(p)
+
+
+def load_config():
+    p = state_path("config.json")
+    if not os.path.exists(p):
+        return {}
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except ValueError:
+        return {}
+
+
+def save_config(cfg):
+    p = state_path("config.json")
+    with open(p, "w") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    os.chmod(p, 0o600)
+
+
+# --------------------------------------------------------------------------- ui
+
+IND = "   "
+_COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+RE_ANSI = re.compile(r"\033\[[0-9;]*m")
+
+
+def paint(code, text):
+    return f"\033[{code}m{text}\033[0m" if _COLOR else text
+
+
+def bold(t):
+    return paint("1", t)
+
+
+def dim(t):
+    return paint("2", t)
+
+
+def _p256(n, text):
+    return f"\033[38;5;{n}m{text}\033[0m" if _COLOR else text
+
+
+def accent(t):
+    return _p256(208, t)
+
+
+def info(t):
+    return _p256(44, t)
+
+
+def ok(t):
+    return _p256(40, t)
+
+
+def warn(t):
+    return _p256(214, t)
+
+
+def err(t):
+    return _p256(203, t)
+
+
+def muted(t):
+    return _p256(243, t)
+
+
+def violet(t):
+    return _p256(141, t)
+
+
+def ok_msg(text):
+    return f"{IND}{ok('✓')} {text}"
+
+
+def err_msg(text):
+    return f"{IND}{err('✗')} {text}"
+
+
+def warn_msg(text):
+    return f"{IND}{warn('!')} {text}"
+
+
+def hint(text):
+    return f"{IND}{dim(text)}"
+
+
+def vis_len(text):
+    return len(RE_ANSI.sub("", text))
+
+
+def truncate(text, width):
+    if vis_len(text) <= width:
+        return text
+    plain = RE_ANSI.sub("", text)
+    if width <= 1:
+        return plain[:width]
+    return plain[:width - 1] + "…"
+
+
+def pad(text, width, align="<"):
+    gap = width - vis_len(text)
+    if gap <= 0:
+        return text
+    if align == ">":
+        return " " * gap + text
+    if align == "^":
+        left = gap // 2
+        return " " * left + text + " " * (gap - left)
+    return text + " " * gap
+
+
+def term_width():
+    try:
+        w = shutil.get_terminal_size((80, 24)).columns
+    except OSError:
+        w = 0
+    return w if w >= 40 else 80
+
+
+def box_width():
+    return max(36, min(78, term_width() - 4))
+
+
+MIN_W = 44
+
+
+def header(title, right="", right_style=info, width=None):
+    w = width or box_width()
+    inner = w - 2
+    left = f"─ {title} ─"
+    tail_plain = f"─ {right}─" if right else ""
+    fill = inner - len(left) - len(tail_plain)
+    if fill < 1:
+        right, tail_plain = "", ""
+        fill = inner - len(left)
+        if fill < 1:
+            left, fill = "─…─", inner - 4
+    tail = muted("─ ") + right_style(right) + muted("─") if right else ""
+    return (f"{IND}{muted('╭')}" + accent(bold(left)) + muted("─" * fill)
+            + tail + muted("╮"))
+
+
+def card(title, rows=(), right="", right_style=info):
+    labels = [len(str(l)) for l, _ in rows if l]
+    lw = min(max(labels + [8]), 24)
+    needed = 0
+    for label, value in rows:
+        value = "" if value is None else str(value)
+        if label:
+            needed = max(needed, lw + 2 + vis_len(value))
+        else:
+            needed = max(needed, vis_len(value))
+    left = f"─ {title} ─"
+    tail = f"─ {right}─" if right else ""
+    w = max(min(needed + 4, box_width()), min(MIN_W, box_width()),
+            len(left) + len(tail) + 3)
+    body = w - 4
+    lw = min(lw, max(6, body - 10))
+    lines = [header(title, right=right, right_style=right_style, width=w)]
+    for label, value in rows:
+        if not label:
+            content = truncate(str(value), body)
+            lines.append(f"{IND}{muted('│')} {content}"
+                         f"{' ' * max(0, body - vis_len(content))} {muted('│')}")
+            continue
+        value = "" if value is None else str(value)
+        lbl = muted(truncate(str(label), lw))
+        val = truncate(value, max(0, body - lw - 2))
+        content = f"{pad(lbl, lw)}  {val}"
+        lines.append(f"{IND}{muted('│')} {content}"
+                     f"{' ' * max(0, body - vis_len(content))} {muted('│')}")
+    lines.append(f"{IND}{muted('╰' + '─' * (w - 2) + '╯')}")
+    return "\n".join(lines)
+
+
+def _table_widths(headers, rows):
+    ncol = len(headers)
+    widths = [len(str(h)) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], vis_len(str(cell)))
+    budget = box_width() - (ncol + 1) - 2 * ncol
+    while sum(widths) > budget:
+        cand = [i for i in range(ncol) if widths[i] > 6]
+        if not cand:
+            break
+        widths[max(cand, key=lambda k: widths[k])] -= 1
+    natural = sum(widths) + 3 * ncol + 1
+    pad_w = min(MIN_W, box_width())
+    if natural < pad_w:
+        widths[-1] += pad_w - natural
+    return widths
+
+
+def render_table(headers, rows, align=None, styles=None, widths=None):
+    ncol = len(headers)
+    align = list(align or ["<"] * ncol)
+    styles = list(styles or [None] * ncol)
+    widths = list(widths or _table_widths(headers, rows))
+
+    def line(cells, head=False):
+        parts = []
+        for i, cell in enumerate(cells):
+            txt = pad(truncate(str(cell), widths[i]), widths[i], align[i])
+            if head:
+                txt = accent(bold(txt))
+            elif styles[i]:
+                txt = styles[i](txt)
+            parts.append(f" {txt} ")
+        return f"{IND}{muted('│')}{muted('│').join(parts)}{muted('│')}"
+
+    seg = "┬".join("─" * (w + 2) for w in widths)
+    mid = "┼".join("─" * (w + 2) for w in widths)
+    bot = "┴".join("─" * (w + 2) for w in widths)
+    out = [f"{IND}{muted('╭' + seg + '╮')}",
+           line(headers, head=True),
+           f"{IND}{muted('├' + mid + '┤')}"]
+    out += [line(r) for r in rows]
+    out.append(f"{IND}{muted('╰' + bot + '╯')}")
+    return "\n".join(out)
+
+
+def print_table(title, headers, rows, right="", align=None, styles=None,
+                right_style=info):
+    widths = _table_widths(headers, rows)
+    width = sum(w + 2 for w in widths) + len(headers) + 1
+    if title:
+        print(header(title, right=right, right_style=right_style, width=width))
+    print(render_table(headers, rows, align=align, styles=styles,
+                       widths=widths))
+
+
+def prompt(label):
+    try:
+        return input(f"{IND}{dim(label)} {accent(bold('▸'))} ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return "b"
+
+
+def parse_index(value, count):
+    if not value.isdigit():
+        return None
+    i = int(value)
+    return i - 1 if 1 <= i <= count else None
+
+
+BANNER = r"""
+   ██╗███╗   ███╗██████╗
+   ██║████╗ ████║╚════██╗
+   ██║██╔████╔██║ █████╔╝
+   ██║██║╚██╔╝██║ ╚═══██╗
+   ██║██║ ╚═╝ ██║██████╔╝
+   ╚═╝╚═╝     ╚═╝╚═════╝
+"""
+
+GRAD = [226, 221, 214, 209, 208, 203]
+
+
+def banner():
+    lines = BANNER.strip("\n").split("\n")
+    art = "\n".join(_p256(GRAD[i % len(GRAD)], ln) for i, ln in enumerate(lines))
+    tag = f"{IND}{bold('myIM3 CLI')}  {muted('·')}  {dim('client tak resmi myIM3')}" \
+          f"  {muted('·')}  {dim('v' + VERSION)}"
+    return f"\n{art}\n{tag}\n"
+
+
+def fmt_msisdn(m):
+    d = m or ""
+    if len(d) == 11:
+        return f"+62 {d[0:3]}-{d[3:7]}-{d[7:]}"
+    return "+62 " + d
+
+
+MENU_ITEMS = [
+    ("1", "Saldo & masa aktif"),
+    ("2", "Paket aktif"),
+    ("3", "Profil"),
+    ("4", "Riwayat transaksi"),
+    ("5", "Kategori paket"),
+    ("6", "Cari paket"),
+    ("7", "Data pengguna"),
+    ("8", "Login ulang / ganti nomor"),
+    ("9", "Logout"),
+    ("0", "Keluar"),
+]
+
+
+def show_menu(msisdn):
+    right = fmt_msisdn(msisdn)
+    left = f"─ MENU ─"
+    tail = f"─ {right}─"
+    widest = max(len(k) + 2 + len(l) for k, l in MENU_ITEMS)
+    width = max(len(left) + len(tail) + 3, widest + 4, MIN_W)
+    print(header("MENU", right=right, width=min(width, box_width())))
+    print()
+    for key, label in MENU_ITEMS:
+        print(f"{IND}{accent(bold(key))}  {label}")
+    print()
+    print(f"{IND}{dim('ketik nomor lalu Enter')}  {muted('·')}  {dim('0 = keluar')}")
+
+
+def interactive():
+    print(banner())
+    client = get_client_optional()
+    while True:
+        if client is None:
+            print(warn_msg("belum login — masukkan nomor untuk menerima OTP"))
+            print()
+            try:
+                client = do_login()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            except SystemExit:
+                print(err_msg("login gagal, coba lagi"))
+                continue
+        show_menu(client.msisdn)
+        try:
+            choice = input(f"{IND}{dim('pilih menu')} {accent(bold('▸'))} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        print()
+        if choice == "0":
+            break
+        if choice == "8":
+            try:
+                client = do_login()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            except SystemExit:
+                print(err_msg("login gagal"))
+            continue
+        if choice == "9":
+            logout()
+            client = None
+            print(ok_msg("berhasil logout — sesi dihapus"))
+            print()
+            continue
+        action = MENU_ACTIONS.get(choice)
+        if not action:
+            print(err_msg("pilihan tidak dikenal"))
+            print()
+            continue
+        try:
+            action(client)
+        except SystemExit:
+            print(err_msg("gagal menjalankan perintah"))
+        try:
+            input(f"\n{IND}{dim('tekan Enter untuk kembali')}")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        print()
+
+
+# --------------------------------------------------------------------------- commands
+
+
+def fetch(c, path, what="data", body=None, msg=None, tries=3):
+    """Call an endpoint through the spinner, retrying server throttling (10021)."""
+    resp = None
+    for attempt in range(tries):
+        with Loader(msg or f"Memuat {what}"):
+            resp = c.post(path, body)
+        if resp.get("code") == "10021" and attempt < tries - 1:
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        break
+    return check(resp, what).get("data", {})
+
+
+def rp(value):
+    try:
+        return "Rp" + f"{int(value):,}".replace(",", ".")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def price_text(p):
+    if p.get("tariff_display"):
+        digits = re.sub(r"\D", "", str(p["tariff_display"]))
+        if digits:
+            return rp(digits)
+        return str(p["tariff_display"])
+    if p.get("tariff") not in (None, ""):
+        return rp(p["tariff"])
+    return "-"
+
+
+def price_int(p):
+    try:
+        if p.get("tariff") not in (None, ""):
+            return int(float(p["tariff"]))
+    except (TypeError, ValueError):
+        pass
+    digits = re.sub(r"\D", "", str(p.get("tariff_display") or ""))
+    return int(digits) if digits else 0
+
+
+def pkg_name(p):
+    return (p.get("package_name") or p.get("short_benefit")
+            or p.get("myim3_product_cd") or p.get("keyword") or "-")
+
+
+def pkg_validity(p):
+    ca = p.get("commercial_attribute") or {}
+    return (ca.get("duration_month") or p.get("validity")
+            or ca.get("validity_type") or "-")
+
+
+def extract_packages(data):
+    if not isinstance(data, dict):
+        return []
+    for key in ("commercial_package", "packages", "packageslist",
+                "package_list", "list"):
+        val = data.get(key)
+        if isinstance(val, list) and val:
+            return val
+    for val in data.values():
+        if isinstance(val, list) and val and isinstance(val[0], dict):
+            return val
+    return []
+
+
+def flatten_categories(data):
+    leaves = []
+    for cat in data if isinstance(data, list) else []:
+        group = cat.get("title") or cat.get("description") or "-"
+        subs = cat.get("categories") or []
+        if subs:
+            for sub in subs:
+                leaves.append({
+                    "group": group,
+                    "title": sub.get("title") or sub.get("description") or "-",
+                    "catid": str(sub.get("categoryid")),
+                    "apiurl": sub.get("apiurl"),
+                })
+        else:
+            leaves.append({
+                "group": group,
+                "title": group,
+                "catid": str(cat.get("categoryid")),
+                "apiurl": cat.get("apiurl"),
+            })
+    return leaves
+
+
+def load_categories(c):
+    data = fetch(c, "/packages/getpackagecategory/v2", what="kategori",
+                 msg="Memuat kategori paket")
+    return flatten_categories(data)
+
+
+def search_groups(c, term):
+    data = fetch(c, "/packages/search", what="hasil pencarian",
+                 body={"SEARCH_TERM": term, "servicename": "GET PACKAGE"},
+                 msg=f"Mencari {dim(term)}")
+    groups = []
+    for cat in data.get("commercial_package_category") or []:
+        items = cat.get("commercial_package") or []
+        if items:
+            groups.append((str(cat.get("category_name") or "Lainnya"), items))
+    return groups
+
+
+def flatten_groups(groups):
+    return [p for _, items in groups for p in items]
+
+
+def search_table(groups, term):
+    rows, flat = [], []
+    for gname, items in groups:
+        for p in items:
+            flat.append(p)
+            rows.append([str(len(flat)), pkg_name(p), price_text(p),
+                         pkg_validity(p), gname])
+    print_table(f"HASIL CARI · {term}",
+                ["No", "Paket", "Harga", "Masa Aktif", "Grup"],
+                rows, right=f"{len(rows)} produk",
+                align=["^", "<", ">", "<", "<"],
+                styles=[muted, None, accent, dim, muted])
+    return flat
+
+
+def browse_search(c):
+    while True:
+        term = prompt("kata kunci pencarian  (b = kembali)")
+        if term in ("b", ""):
+            return
+        if len(term.strip()) < 2:
+            print(err_msg("kata kunci minimal 2 karakter"))
+            continue
+        term = term.strip()
+        groups = search_groups(c, term)
+        items = flatten_groups(groups)
+        if not items:
+            print()
+            print(card("HASIL CARI",
+                       rows=[(None, f"tidak ada hasil untuk {term!r}")]))
+            continue
+        while True:
+            print()
+            flat = search_table(groups, term)
+            print()
+            ans = prompt("pilih nomor paket  (b = kembali)")
+            if ans in ("b", ""):
+                break
+            idx = parse_index(ans, len(flat))
+            if idx is None:
+                print(err_msg("nomor tidak valid"))
+                continue
+            print()
+            show_package_detail(flat[idx])
+            detail_action(c, flat[idx])
+
+
+def cmd_search(c, term="", buy=0, pay=False, yes=False):
+    term = (term or prompt("kata kunci pencarian")).strip()
+    if len(term) < 2:
+        die("kata kunci minimal 2 karakter")
+    groups = search_groups(c, term)
+    items = flatten_groups(groups)
+    if not items:
+        print(card("HASIL CARI", rows=[(None, f"tidak ada hasil untuk {term!r}")]))
+        return
+    if buy:
+        if buy < 1 or buy > len(items):
+            die(f"nomor {buy} di luar jangkauan (1-{len(items)})")
+        print()
+        run_buy(c, items[buy - 1], yes=yes, dry_run=not pay)
+        return
+    print()
+    search_table(groups, term)
+    print()
+    print(hint("beli: im3 search <kata> --buy <nomor> [--pay]  ·  menu `im3` → 6"))
+
+
+def package_table(items, title, right=None):
+    rows = [[str(i), pkg_name(p), price_text(p), pkg_validity(p)]
+            for i, p in enumerate(items, 1)]
+    print_table(title, ["No", "Paket", "Harga", "Masa Aktif"], rows,
+                right=right or f"{len(items)} paket",
+                align=["^", "<", ">", "<"],
+                styles=[muted, None, accent, dim])
+
+
+def category_table(leaves):
+    rows = [[str(i), leaf["group"], leaf["title"]]
+            for i, leaf in enumerate(leaves, 1)]
+    print_table("KATEGORI PAKET", ["No", "Grup", "Kategori"], rows,
+                right=f"{len(leaves)} pilihan",
+                align=["^", "<", "<"], styles=[muted, dim, None])
+
+
+def show_package_detail(p):
+    ca = p.get("commercial_attribute") or {}
+    rows = []
+
+    def add(label, value, style=None):
+        if value in (None, "", "null", "None", "-"):
+            return
+        value = str(value)
+        rows.append((label, style(value) if style else value))
+
+    if p.get("original_tariff") and str(p.get("original_tariff")) != str(p.get("tariff")):
+        add("Harga normal", p["original_tariff"], rp)
+    add("Masa aktif", pkg_validity(p))
+    add("Manfaat", ca.get("short_benefit"), accent)
+    add("Kuota", ca.get("family_name"))
+    add("Deskripsi", p.get("package_subtitle"))
+    add("Info", p.get("package_footer_desc"))
+    add("Bisa dibeli", "ya" if str(p.get("buy_flag")).upper() == "Y" else "tidak")
+    add("Tipe", p.get("offertype"))
+    add("Kode", p.get("pvr_code"), dim)
+    add("Keyword", p.get("keyword"), violet)
+    print(card("DETAIL PAKET", rows=rows, right=price_text(p),
+               right_style=lambda t: accent(bold(t))))
+
+
+def detail_action(c, p):
+    ans = prompt("Enter = kembali  ·  y = beli paket ini")
+    if ans.lower() not in ("y", "ya", "beli"):
+        return
+    try:
+        run_buy(c, p, dry_run=False)
+    except SystemExit:
+        pass
+
+
+def browse_packages(c):
+    leaves = load_categories(c)
+    if not leaves:
+        print(card("KATEGORI PAKET", rows=[(None, "tidak ada kategori paket")]))
+        return
+    while True:
+        print()
+        category_table(leaves)
+        print()
+        ans = prompt("pilih nomor kategori  (b = kembali)")
+        if ans in ("b", ""):
+            return
+        idx = parse_index(ans, len(leaves))
+        if idx is None:
+            print(err_msg("nomor tidak valid"))
+            continue
+        leaf = leaves[idx]
+        data = fetch(c, leaf["apiurl"], what="daftar paket",
+                     msg=f"Memuat paket {leaf['title']}")
+        items = extract_packages(data)
+        if not items:
+            print()
+            print(card(leaf["title"].upper(),
+                       rows=[(None, "belum ada paket di kategori ini")]))
+            continue
+        while True:
+            print()
+            package_table(items, f"PAKET · {leaf['title'].upper()}")
+            print()
+            ans = prompt("pilih nomor paket  (b = kembali)")
+            if ans in ("b", ""):
+                break
+            idx = parse_index(ans, len(items))
+            if idx is None:
+                print(err_msg("nomor tidak valid"))
+                continue
+            print()
+            show_package_detail(items[idx])
+            detail_action(c, items[idx])
+
+
+# ------------------------------------------------------------------------ buy
+
+
+def fetch_package(c, pvr):
+    data = fetch(c, "/packages/getpackage", what="detail paket",
+                 body={"servicename": "GET PACKAGE", "PVR_CODE": pvr,
+                       "cvmtype": 0},
+                 msg="Memuat detail paket")
+    pkg = data.get("commercial_package")
+    if not pkg:
+        die(f"paket {pvr} tidak ditemukan")
+    return pkg
+
+
+def fetch_balance(c):
+    d = fetch(c, "/dashboard/get/v4", what="saldo", msg="Mengambil saldo")
+    val = ((d.get("prepaidinfo") or {}).get("balance")
+           or (d.get("packdata") or {}).get("lastbalance") or "0")
+    try:
+        return int(float(val))
+    except (TypeError, ValueError):
+        return 0
+
+
+def pay_channels(c):
+    data = fetch(c, "/payment/checkavailability", what="kanal bayar",
+                 body={"paymentchannels": "", "transtype": "package",
+                       "operationtype": "buy"},
+                 msg="Mengecek kanal pembayaran")
+    return data.get("sofAvailability") or []
+
+
+def transtype_of(pkg):
+    t = str(pkg.get("offertype") or "").lower()
+    if t == "cvm":
+        return "cvm"
+    if t == "content":
+        return "content"
+    return "package"
+
+
+def is_vas(pkg):
+    return (str(pkg.get("offertype") or "").lower() == "content"
+            or str(pkg.get("package_type") or "") == "5")
+
+
+def pay_endpoint(pkg, channel):
+    channelid = str(channel.get("channelid") or "").upper()
+    if channelid == "BALANCE":
+        if str(pkg.get("offertype") or "").lower() == "cvm":
+            return "/offer/handleintent"
+        return "/vaspackages/activate" if is_vas(pkg) else "/packages/activate"
+    if str(channel.get("paymentgw") or "").upper() == "ESB":
+        return "/esb/initiatepayment"
+    return "/payment/payment"
+
+
+def discount_price(pkg):
+    try:
+        original = float(pkg.get("original_tariff"))
+        tariff = float(pkg.get("tariff"))
+    except (TypeError, ValueError):
+        return "0"
+    return str(int(original - tariff)) if original != tariff else "0"
+
+
+def show_quote(c, pkg, channels, saldo, price):
+    after = saldo - price
+    names = ", ".join(str(ch.get("name") or ch.get("channelid") or "")
+                      for ch in channels) or "-"
+    rows = [("Paket", bold(pkg_name(pkg))),
+            ("Harga", accent(bold(rp(price)))),
+            ("Saldo", rp(saldo)),
+            ("Sisa", (rp(after) if after >= 0 else err(f"kurang {rp(-after)}"))),
+            ("Metode", info(names)),
+            ("Kode", violet(str(pkg.get("pvr_code") or "-")))]
+    if pkg.get("keyword"):
+        rows.append(("Keyword", violet(str(pkg["keyword"]))))
+    print(card("QUOTE PEMBELIAN", rows=rows, right=fmt_msisdn(c.msisdn),
+               right_style=accent))
+    if after < 0:
+        print(warn_msg(f"saldo kurang {rp(-after)} — transaksi bisa ditolak server"))
+
+
+def confirm_buy(price, yes=False):
+    if yes:
+        return True
+    if not sys.stdin.isatty():
+        die("mode non-interaktif: tambahkan --yes untuk konfirmasi pembelian")
+    expect = f"BELI {price}"
+    print()
+    ans = prompt(f"ketik {accent(bold(expect))} untuk konfirmasi  (b = batal)")
+    if ans == expect:
+        return True
+    if ans.strip().lower() in ("", "b", "batal", "n", "no", "q", "quit"):
+        print(err_msg("konfirmasi dibatalkan"))
+        return False
+    print(err_msg(f"tidak cocok — diharapkan {expect}"))
+    return False
+
+
+def check_eligible(c, pkg, channel):
+    body = {
+        "transtype": transtype_of(pkg),
+        "operationtype": "buy",
+        "paymentchannel": str(channel.get("channelid") or ""),
+        "offerid": str(pkg.get("pvr_code") or ""),
+        "transid": "",
+        "tomsisdn": "62" + (c.msisdn or ""),
+        "normalprice": str(pkg.get("original_tariff") or ""),
+        "packagename": str(pkg.get("package_name") or ""),
+        "name": "",
+        "keyword": str(pkg.get("keyword") or ""),
+        "shortcode": str(pkg.get("shortcode") or ""),
+    }
+    with Loader("Mengecek kelayakan pembelian"):
+        resp = c.post("/packages/checkeligible", body)
+    check(resp, "cek kelayakan")
+    return resp.get("data") or {}
+
+
+def pay(c, pkg, channel):
+    body = {
+        "transtype": transtype_of(pkg),
+        "operationtype": "buy",
+        "paymentchannel": str(channel.get("channelid") or ""),
+        "offerid": str(pkg.get("pvr_code") or ""),
+        "keyword": str(pkg.get("keyword") or ""),
+        "shortcode": str(pkg.get("shortcode") or ""),
+        "tomsisdn": "62" + (c.msisdn or ""),
+        "normalprice": str(pkg.get("original_tariff") or ""),
+        "discountprice": discount_price(pkg),
+        "packagename": str(pkg.get("package_name") or ""),
+        "name": "",
+        "transid": "",
+        "walletmsisdn": "",
+        "type": str(channel.get("groupid") or ""),
+    }
+    if pkg.get("cvmtype") not in (None, "", 0, 0.0):
+        body["cvmtype"] = str(pkg["cvmtype"])
+    path = pay_endpoint(pkg, channel)
+    with Loader(f"Mengirim permintaan pembayaran {dim(path)}"):
+        resp = c.post(path, body)
+    check(resp, "pembayaran")
+    data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+    transid = str(resp.get("transid") or data.get("transid") or "")
+    if not transid:
+        die(f"transid tidak ada di response: {json.dumps(resp)[:300]}")
+    return transid
+
+
+def poll_payment(c, transid, tries=8, interval=3.0):
+    status, detail = "PENDING", {}
+    for i in range(tries):
+        with Loader(f"Menunggu konfirmasi  ({i + 1}/{tries})"):
+            resp = c.post("/payment/chkstatus/v2", {"paymenttid": transid})
+        if resp.get("status") == "0":
+            detail = (resp.get("data") or {}).get("checkStatusResp") or {}
+            status = str(detail.get("statusTransaction") or "PENDING").upper()
+            if status in ("SUCCESS", "FAILED"):
+                return status, detail
+        if i < tries - 1:
+            time.sleep(interval)
+    return status, detail
+
+
+def receipt(c, transid):
+    with Loader("Mengambil struk"):
+        resp = c.post("/transaction/getbyid", {"transid": transid})
+    if resp.get("status") != "0":
+        return None
+    tx = (resp.get("data") or {}).get("transactions") or []
+    return tx[0] if tx else None
+
+
+def show_receipt(t, transid):
+    amt = _first(t, TX_AMT)
+    amt = rp(amt) if amt != "-" and str(amt).lstrip("-").isdigit() else amt
+    rows = [("Waktu", _first(t, TX_DATE)),
+            ("Keterangan", _first(t, TX_DESC)),
+            ("Jumlah", accent(bold(amt))),
+            ("Status", _status_style(_first(t, TX_STAT))),
+            ("Transid", dim(transid))]
+    print()
+    print(card("STRUK", rows=rows, right="Pembelian", right_style=info))
+
+
+def audit_purchase(entry):
+    p = state_path("purchases.jsonl")
+    with open(p, "a") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    os.chmod(p, 0o600)
+
+
+def run_buy(c, pkg, yes=False, dry_run=False):
+    pvr = str(pkg.get("pvr_code") or "").strip()
+    if not pvr:
+        die("paket ini tidak punya kode pvr_code — tidak bisa dibeli")
+    if str(pkg.get("buy_flag") or "Y").upper() == "N":
+        die("paket ini tidak bisa dibeli dari app (buy_flag != Y)")
+    price = price_int(pkg)
+    if not price:
+        die("harga paket tidak diketahui — batal")
+    channels = pay_channels(c)
+    if not channels:
+        die("tidak ada kanal pembayaran yang tersedia")
+    channel = next((ch for ch in channels
+                    if str(ch.get("channelid")).upper() == "BALANCE"), channels[0])
+    saldo = fetch_balance(c)
+    show_quote(c, pkg, channels, saldo, price)
+
+    elig = check_eligible(c, pkg, channel)
+    state = str(elig.get("eligibility") or "").upper()
+    if state == "ELIGIBLE":
+        print(f"   {ok('✓')} nomor memenuhi syarat untuk paket ini")
+    else:
+        reason = (elig.get("responsemsg") or elig.get("ineligiblereason")
+                  or elig.get("errordesc") or "tidak memenuhi syarat")
+        die(f"nomor tidak memenuhi syarat: {reason}")
+
+    if dry_run:
+        print()
+        print(hint("dry-run — tidak ada pembayaran. ulangi dengan --pay untuk beli"))
+        return
+
+    print()
+    if not confirm_buy(price, yes):
+        return
+
+    transid = pay(c, pkg, channel)
+    print(f"   {ok('✓')} permintaan terkirim  transid {dim(transid)}")
+    status, _ = poll_payment(c, transid)
+    entry = {"time": datetime.datetime.now().isoformat(timespec="seconds"),
+             "msisdn": c.msisdn, "pvr_code": pvr, "package": pkg_name(pkg),
+             "price": price, "channel": str(channel.get("channelid") or ""),
+             "transid": transid, "status": status}
+    audit_purchase(entry)
+
+    if status == "SUCCESS":
+        print(ok_msg(f"pembelian berhasil — {pkg_name(pkg)} {rp(price)}"))
+    elif status == "FAILED":
+        print(err_msg("pembelian gagal"))
+    else:
+        print(warn_msg(f"status {status} — pantau di menu 4 (Riwayat transaksi)"))
+    rcpt = receipt(c, transid)
+    if rcpt:
+        show_receipt(rcpt, transid)
+    print(hint(f"catatan pembelian: {dim(state_path('purchases.jsonl'))}"))
+
+
+def cmd_buy(c, pvr="", pay=False, yes=False, dry_run=False):
+    if not pvr:
+        pvr = prompt("kode paket (pvr_code)").strip()
+    if not pvr:
+        die("butuh kode paket: im3 buy <pvr_code>  (kode ada di layar detail)")
+    pkg = fetch_package(c, pvr)
+    run_buy(c, pkg, yes=yes, dry_run=dry_run or not pay)
+
+
+def cmd_balance(c):
+    d = fetch(c, "/dashboard/get/v4", what="saldo", msg="Mengambil saldo")
+    info_ = d.get("prepaidinfo", {})
+    balance = info_.get("balance") or d.get("packdata", {}).get("lastbalance") or "0"
+    rows = [("Saldo", accent(bold(rp(balance))))]
+    if info_.get("cardactiveuntil"):
+        rows.append(("Masa aktif", info_["cardactiveuntil"]))
+    if info_.get("graceperioduntil"):
+        rows.append(("Tenggang", info_["graceperioduntil"]))
+    for k, v in list((d.get("impoints") or {}).items())[:4]:
+        rows.append((str(k).replace("_", " ").title(), str(v)))
+    print(card("SALDO", rows=rows, right=fmt_msisdn(c.msisdn),
+               right_style=lambda t: accent(t)))
+
+
+def _print_packages(d):
+    pk = d.get("packdata", {})
+    plist = pk.get("packageslist", [])
+    if not plist:
+        print(card("PAKET AKTIF", rows=[(None, "tidak ada paket aktif")]))
+        return
+    for p in plist:
+        name = p.get("ServiceDescription") or p.get("ServiceName") or "Paket"
+        rows = []
+        if p.get("EndDate"):
+            rows.append(("Berlaku s/d", str(p["EndDate"])))
+        for q in p.get("Quotas", []):
+            if q.get("show") != "ON":
+                continue
+            if q.get("unlimitedFlag") == "true":
+                rows.append((q.get("name"), ok("unlimited")))
+            elif q.get("remainingQuota") or q.get("initialQuota"):
+                rows.append((q.get("name"),
+                             f"{q.get('remainingQuota')}/{q.get('initialQuota')} "
+                             f"{q.get('quotaUnit', '')}".strip()))
+        badge = str(p.get("ServiceType") or "").strip()
+        print(card(str(name), rows=rows, right=f"[{badge}]" if badge else "",
+                   right_style=info))
+        print()
+
+
+def cmd_packages(c):
+    d = fetch(c, "/dashboard/get/v4", what="paket aktif",
+              msg="Mengambil paket aktif")
+    _print_packages(d)
+
+
+def cmd_profile(c):
+    d = fetch(c, "/profile/get", what="profil", msg="Mengambil profil")
+    rows = [("Nomor", accent(fmt_msisdn(c.msisdn)))]
+    labels = {"fname": "Nama", "username": "Username", "email": "Email",
+              "utype": "Tipe", "evf": "Verifikasi"}
+    for key, label in labels.items():
+        if d.get(key) not in (None, ""):
+            rows.append((label, d[key]))
+    print(card("PROFIL", rows=rows, right="myIM3",
+               right_style=lambda t: info(t)))
+    print(hint("json lengkap: im3 raw /profile/get"))
+
+
+BULAN = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun",
+         "Jul", "Agu", "Sep", "Okt", "Nov", "Des"]
+
+
+def fmt_dt(s):
+    m = re.match(r"^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})", str(s or ""))
+    if not m:
+        return str(s or "-")
+    y, mo, d, hh, mm = m.groups()
+    return f"{int(d)} {BULAN[int(mo) - 1]} {y} {hh}:{mm}"
+
+
+def fmt_month(ym):
+    m = re.match(r"^(\d{4})(\d{2})$", str(ym or ""))
+    if not m:
+        return str(ym or "-")
+    return f"{BULAN[int(m.group(2)) - 1]} {m.group(1)}"
+
+
+def _unit(v):
+    if not isinstance(v, dict) or v.get("value") is None:
+        return "-"
+    return f"{v.get('value')} {v.get('unit', '')}".strip()
+
+
+def cmd_userdata(c):
+    d = fetch(c, "/usages/history", what="pemakaian",
+              msg="Mengambil riwayat pemakaian")
+    summary = d.get("summary") or {}
+    rows = [(k, _unit(summary.get(key)))
+            for k, key in (("Data", "data"), ("Nelpon", "voice"), ("SMS", "sms"))
+            if isinstance(summary.get(key), dict)]
+    if d.get("queryUsageConsumptionDate"):
+        rows.append(("Sampai", fmt_dt(d["queryUsageConsumptionDate"])))
+    print(card("PEMAKAIAN", rows=rows or [(None, "belum ada data pemakaian")]))
+    print()
+
+    def per_month(key):
+        return {str(x.get("month")): x for x in (d.get(key) or [])
+                if isinstance(x, dict)}
+
+    md, mv, ms = per_month("data"), per_month("voice"), per_month("sms")
+    months = sorted(set(md) | set(mv) | set(ms), reverse=True)
+    if months:
+        brows = [[fmt_month(m), _unit(md.get(m)), _unit(mv.get(m)),
+                  _unit(ms.get(m))] for m in months]
+        print_table("PEMAKAIAN BULANAN", ["Bulan", "Data", "Nelpon", "SMS"], brows,
+                    right=f"{len(months)} bulan",
+                    align=["<", ">", ">", ">"],
+                    styles=[muted, accent, None, None])
+        print()
+
+    tx = d.get("transactions") or {}
+    data_rows = tx.get("data") or []
+    if data_rows:
+        rows = [[str(x.get("title") or "-"), str(x.get("desc") or "-")]
+                for x in data_rows[:8]]
+        print_table("RIWAYAT PAKET", ["Waktu", "Paket"], rows,
+                    right=f"{len(data_rows)} data",
+                    align=["<", "<"], styles=[muted, None])
+        print()
+    voice_rows = tx.get("voice") or []
+    if voice_rows:
+        rows = [[str(x.get("title") or "-"), str(x.get("desc") or "-"),
+                 str(x.get("amount") or "-")] for x in voice_rows[:8]]
+        print_table("RIWAYAT PANGGILAN", ["Waktu", "Tujuan", "Menit"], rows,
+                    right=f"{len(voice_rows)} data",
+                    align=["<", "<", ">"], styles=[muted, None, accent])
+        print()
+
+    vas = (fetch(c, "/packages/getvaslist", what="langganan",
+                 msg="Mengambil langganan").get("packageslist") or [])
+    if vas:
+        rows = [[str(i),
+                 str(v.get("package_name") or v.get("title") or v.get("name") or "-"),
+                 str(v.get("tariff_display") or v.get("validity") or "-")]
+                for i, v in enumerate(vas, 1)]
+        print_table("LANGGANAN (VAS)", ["No", "Nama", "Info"], rows,
+                    right=f"{len(vas)} langganan",
+                    align=["^", "<", "<"], styles=[muted, None, None])
+    else:
+        print(card("LANGGANAN (VAS)", rows=[(None, "tidak ada langganan aktif")]))
+    print()
+
+    ci = fetch(c, "/customerprofile/get", what="info pelanggan",
+               msg="Mengambil info pelanggan")
+    crows = []
+    for key, label in (("custstatus", "Status"), ("custname", "Nama"),
+                       ("custphonenumber", "Telp"), ("custbirthdate", "TTL"),
+                       ("custgender", "Kelamin"), ("custemail", "Email")):
+        val = ci.get(key)
+        if val in (None, ""):
+            continue
+        if key == "custstatus":
+            crows.append((label, ok(str(val)) if str(val).lower().startswith("activ")
+                          else warn(str(val))))
+        else:
+            crows.append((label, str(val)))
+    if crows:
+        print(card("INFO PELANGGAN", rows=crows, right="myIM3", right_style=info))
+
+
+TX_DATE = ("transactiondate", "transactionDate", "txdate", "date",
+           "createddate", "postdate", "trxdttm", "transactiontime")
+TX_DESC = ("description", "trxdetails", "details", "narration", "remark",
+           "desc", "service", "servicedesc", "trxtypename")
+TX_AMT = ("amount", "transactionvalue", "trfamount", "value", "nominal",
+          "trxamount")
+TX_STAT = ("status", "txstatus", "transactionstatus", "trxstatus")
+
+
+def _first(item, keys):
+    for k in keys:
+        v = item.get(k)
+        if v not in (None, "", "null", "None"):
+            return str(v)
+    return "-"
+
+
+def _status_style(s):
+    low = s.lower()
+    if any(k in low for k in ("success", "berhasil", "complete", "paid", "ok")):
+        return ok(s)
+    if any(k in low for k in ("pending", "proses", "menunggu")):
+        return warn(s)
+    if any(k in low for k in ("fail", "gagal", "error", "cancel", "batal")):
+        return err(s)
+    return s
+
+
+def cmd_transactions(c):
+    d = fetch(c, "/transaction/history", what="riwayat",
+              msg="Mengambil riwayat transaksi", body={
+                  "fromdate": "", "todate": "",
+                  "pagenation": {"start": 0, "end": 10},
+                  "status": "", "category": "",
+              })
+    tx = d.get("transactions") or []
+    total = d.get("totalRecords") or len(tx)
+    if not tx:
+        print(card("RIWAYAT TRANSAKSI",
+                   rows=[(None, "belum ada transaksi")]))
+        return
+    rows = []
+    for item in tx:
+        desc = _first(item, TX_DESC)
+        amt = _first(item, TX_AMT)
+        amt = rp(amt) if amt != "-" and str(amt).lstrip("-").isdigit() else amt
+        rows.append([_first(item, TX_DATE), desc, amt,
+                     _status_style(_first(item, TX_STAT))])
+    print_table("RIWAYAT TRANSAKSI", ["Waktu", "Keterangan", "Jumlah", "Status"],
+                rows, right=f"{len(tx)}/{total} data",
+                align=["<", "<", ">", "<"],
+                styles=[muted, None, accent, None])
+    if total > len(tx):
+        print(hint(f"menampilkan {len(tx)} dari {total} transaksi"))
+
+
+def cmd_packlist(c, category=""):
+    leaves = load_categories(c)
+    if category:
+        leaf = next((x for x in leaves if x["catid"] == str(category)), None)
+        if not leaf:
+            die(f"kategori {category} tidak ditemukan")
+        data = fetch(c, leaf["apiurl"], what="daftar paket",
+                     msg=f"Memuat paket {leaf['title']}")
+        items = extract_packages(data)
+        if not items:
+            print(card(leaf["title"].upper(),
+                       rows=[(None, "belum ada paket di kategori ini")]))
+            return
+        package_table(items, f"PAKET · {leaf['title'].upper()}")
+        return
+    category_table(leaves)
+    print()
+    print(hint("pakai: im3 packlist <categoryid>  atau jalankan `im3` untuk menu"))
+
+
+def cmd_raw(c, path, body):
+    with Loader("Memanggil endpoint"):
+        resp = c.post(path, json.loads(body) if body else {})
+    print(json.dumps(resp, indent=2, ensure_ascii=False))
+
+
+# ------------------------------------------------------------------------ watch
+
+DATE_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y",
+                "%d-%m-%Y", "%d%m%Y", "%Y%m%d", "%d %b %Y", "%d %B %Y")
+
+
+def parse_date(s):
+    text = str(s or "").strip().replace("T", " ")
+    text = text.split("+")[0].rstrip("Zz ").strip()
+    if not text:
+        return None
+    for fmt in DATE_FORMATS:
+        try:
+            return datetime.datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    digits = re.sub(r"\D", "", str(s or ""))
+    if len(digits) == 8:
+        for fmt in ("%Y%m%d", "%d%m%Y"):
+            try:
+                return datetime.datetime.strptime(digits, fmt)
+            except ValueError:
+                continue
+    return None
+
+
+def fmt_num(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return str(int(f)) if f == int(f) else f"{f:.1f}"
+
+
+def gather_status(c):
+    d = fetch(c, "/dashboard/get/v4", what="status", msg="Mengambil status nomor")
+    info = d.get("prepaidinfo") or {}
+    raw = info.get("balance") or (d.get("packdata") or {}).get("lastbalance") or "0"
+    try:
+        saldo = int(float(raw))
+    except (TypeError, ValueError):
+        saldo = 0
+    packages = []
+    for p in (d.get("packdata") or {}).get("packageslist") or []:
+        name = str(p.get("ServiceDescription") or p.get("ServiceName") or "Paket")
+        quotas = []
+        for q in p.get("Quotas") or []:
+            if q.get("show") != "ON":
+                continue
+            qname = str(q.get("name") or "Kuota")
+            if str(q.get("unlimitedFlag")).lower() == "true":
+                quotas.append({"name": qname, "pct": 100.0,
+                               "text": ok("unlimited")})
+                continue
+            try:
+                rem = float(q.get("remainingQuota"))
+                init = float(q.get("initialQuota"))
+            except (TypeError, ValueError):
+                continue
+            if not init:
+                continue
+            unit = str(q.get("quotaUnit") or "").strip()
+            quotas.append({
+                "name": qname,
+                "pct": rem / init * 100.0,
+                "text": f"{fmt_num(rem)}/{fmt_num(init)} {unit}".strip(),
+            })
+        packages.append({"name": name, "end": str(p.get("EndDate") or ""),
+                         "quotas": quotas})
+    return {"saldo": saldo, "msisdn": c.msisdn,
+            "active_until": str(info.get("cardactiveuntil") or ""),
+            "grace_until": str(info.get("graceperioduntil") or ""),
+            "packages": packages}
+
+
+def _days_left(when, now):
+    d = parse_date(when)
+    if not d:
+        return None
+    return (d.date() - now.date()).days
+
+
+def evaluate_alerts(st, saldo_min=5000, kuota_min=10, hari=3, now=None):
+    now = now or datetime.datetime.now()
+    alerts = []
+    if saldo_min and st["saldo"] < saldo_min:
+        alerts.append({"key": f"saldo:{saldo_min}",
+                       "text": f"saldo {rp(st['saldo'])} — di bawah batas {rp(saldo_min)}"})
+    if kuota_min >= 0:
+        for pkg in st["packages"]:
+            for q in pkg["quotas"]:
+                if q["pct"] <= kuota_min:
+                    alerts.append({
+                        "key": f"kuota:{pkg['name']}:{q['name']}",
+                        "text": (f"{pkg['name']} · {q['name']} sisa {q['text']} "
+                                 f"({q['pct']:.0f}%)"),
+                    })
+    if hari >= 0:
+        for pkg in st["packages"]:
+            left = _days_left(pkg["end"], now)
+            if left is None or left > hari:
+                continue
+            when = "berakhir hari ini" if left == 0 else \
+                ("sudah berakhir" if left < 0 else f"berakhir {left} hari lagi")
+            alerts.append({"key": f"akhir:{pkg['name']}:{pkg['end']}",
+                           "text": f"{pkg['name']} {when} ({pkg['end']})"})
+        left = _days_left(st.get("active_until"), now)
+        if left is not None and left <= hari:
+            when = "berakhir hari ini" if left == 0 else \
+                ("sudah berakhir" if left < 0 else f"berakhir {left} hari lagi")
+            alerts.append({"key": f"masaaktif:{st.get('active_until')}",
+                           "text": f"masa aktif {when} ({st.get('active_until')})"})
+    return alerts
+
+
+def print_watch(st, alerts):
+    rows = [("Saldo", accent(bold(rp(st["saldo"]))))]
+    if st.get("active_until"):
+        rows.append(("Masa aktif", st["active_until"]))
+    if st.get("grace_until"):
+        rows.append(("Tenggang", st["grace_until"]))
+    print(card("STATUS", rows=rows, right=fmt_msisdn(st.get("msisdn")),
+               right_style=accent))
+    keys = {a["key"] for a in alerts}
+    qrows = []
+    for pkg in st["packages"]:
+        for q in pkg["quotas"]:
+            flagged = f"kuota:{pkg['name']}:{q['name']}" in keys
+            qrows.append([pkg["name"], q["name"], q["text"], f"{q['pct']:.0f}%",
+                          warn("cek") if flagged else ok("aman")])
+    if qrows:
+        shown = qrows[:20]
+        print()
+        print_table("KUOTA", ["Paket", "Kuota", "Sisa", "%", "Status"], shown,
+                    right=f"{len(qrows)} bagian",
+                    align=["<", "<", ">", ">", "<"],
+                    styles=[muted, None, None, accent, None])
+        if len(qrows) > len(shown):
+            print(hint(f"menampilkan {len(shown)} dari {len(qrows)} bagian kuota"))
+    print()
+    if alerts:
+        for a in alerts:
+            print(warn_msg(a["text"]))
+    else:
+        print(ok_msg("saldo, kuota, dan masa aktif aman"))
+    print()
+
+
+def send_telegram(text):
+    tg = load_config().get("telegram") or {}
+    token, chat = tg.get("token"), tg.get("chat_id")
+    if not token or not chat:
+        return None
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          json={"chat_id": str(chat), "text": text},
+                          timeout=20)
+        return bool(r.json().get("ok"))
+    except (requests.RequestException, ValueError):
+        return False
+
+
+def watch_alert_message(st, sent):
+    lines = [f"im3 CLI v{VERSION} · {fmt_msisdn(st.get('msisdn'))}"]
+    lines += ["- " + RE_ANSI.sub("", a["text"]) for a in sent]
+    return "\n".join(lines)
+
+
+def dispatch_alerts(alerts, st, cooldown, force):
+    """Record alert timestamps, return the ones due for notification."""
+    p = state_path("watch-state.json")
+    try:
+        with open(p) as f:
+            prev = (json.load(f).get("alerts") or {})
+    except (OSError, ValueError):
+        prev = {}
+    now = datetime.datetime.now()
+    sent = []
+    for a in alerts:
+        last = prev.get(a["key"])
+        fresh = True
+        if last and not force:
+            try:
+                fresh = (now - datetime.datetime.fromisoformat(last)).total_seconds() >= cooldown
+            except ValueError:
+                fresh = True
+        if fresh:
+            sent.append(a)
+    sent_keys = {a["key"] for a in sent}
+    state = {}
+    for a in alerts:
+        state[a["key"]] = now.isoformat(timespec="seconds") \
+            if a["key"] in sent_keys else prev.get(a["key"],
+                                                   now.isoformat(timespec="seconds"))
+    with open(p, "w") as f:
+        json.dump({"alerts": state}, f)
+    os.chmod(p, 0o600)
+    return sent
+
+
+def cmd_watch_setup(args):
+    if args.setup_telegram:
+        cfg = load_config()
+        cfg["telegram"] = {"token": args.setup_telegram[0].strip(),
+                           "chat_id": args.setup_telegram[1].strip()}
+        save_config(cfg)
+        print(ok_msg("kredensial Telegram tersimpan"))
+        print(hint("uji dengan: im3 watch --test"))
+        return
+    if not (load_config().get("telegram") or {}).get("token"):
+        die("Telegram belum dikonfigurasi — jalankan: "
+            "im3 watch --setup-telegram <token> <chat_id>")
+    res = send_telegram(f"im3 CLI v{VERSION} — pesan uji OK "
+                        f"({datetime.datetime.now():%Y-%m-%d %H:%M})")
+    if res:
+        print(ok_msg("pesan uji terkirim ke Telegram"))
+    else:
+        die("Telegram gagal mengirim pesan uji — cek token/chat_id")
+
+
+def cmd_watch(c, opts):
+    failures = 0
+    try:
+        while True:
+            try:
+                st = gather_status(c)
+                failures = 0
+            except SystemExit:
+                failures += 1
+                if not opts.loop or failures >= 3:
+                    raise
+                print(err_msg(f"gagal mengambil status ({failures}/3)"))
+                time.sleep(max(30, opts.interval))
+                continue
+            alerts = evaluate_alerts(st, opts.saldo_min, opts.kuota_min, opts.hari)
+            print_watch(st, alerts)
+            sent = dispatch_alerts(alerts, st, opts.cooldown, opts.force)
+            if sent:
+                res = send_telegram(watch_alert_message(st, sent))
+                if res is True:
+                    print(ok_msg(f"notifikasi terkirim ({len(sent)} peringatan)"))
+                elif res is False:
+                    print(warn_msg("Telegram gagal mengirim notifikasi"))
+                else:
+                    print(hint("notifikasi Telegram belum aktif — "
+                              "im3 watch --setup-telegram <token> <chat_id>"))
+                print()
+            if not opts.loop:
+                sys.exit(2 if alerts else 0)
+            print(hint(f"cek berikutnya dalam {opts.interval}s"))
+            time.sleep(max(10, opts.interval))
+    except KeyboardInterrupt:
+        print()
+        print(ok_msg("watch dihentikan"))
+
+
+COMMANDS = {
+    "balance": cmd_balance,
+    "packages": cmd_packages,
+    "profile": cmd_profile,
+    "transactions": cmd_transactions,
+    "search": cmd_search,
+    "userdata": cmd_userdata,
+}
+
+MENU_ACTIONS = {
+    "1": cmd_balance,
+    "2": cmd_packages,
+    "3": cmd_profile,
+    "4": cmd_transactions,
+    "5": browse_packages,
+    "6": browse_search,
+    "7": cmd_userdata,
+}
+
+args = None
+
+
+def main():
+    global args
+    p = argparse.ArgumentParser(prog="im3", description="IM3 CLI (unofficial myIM3 client)")
+    p.add_argument("-V", "--version", action="version", version=f"im3 {VERSION}")
+    sub = p.add_subparsers(dest="cmd")
+    sub.add_parser("login", help="login with OTP")
+    sub.add_parser("logout", help="hapus sesi tersimpan")
+    sub.add_parser("balance", help="cek saldo")
+    sub.add_parser("packages", help="cek paket aktif")
+    sub.add_parser("profile", help="cek profil")
+    sub.add_parser("transactions", help="riwayat transaksi")
+    pl = sub.add_parser("packlist", help="kategori/daftar paket yang bisa dibeli")
+    pl.add_argument("category", nargs="?", default="",
+                    help="category id; kosongkan untuk melihat kategori")
+    se = sub.add_parser("search", help="cari paket dari katalog (termasuk di luar kategori)")
+    se.add_argument("term", nargs="?", default="", help="kata kunci")
+    se.add_argument("--buy", type=int, default=0, metavar="N",
+                    help="proses hasil ke-N (default: hanya tampilkan)")
+    se.add_argument("--pay", action="store_true", help="lakukan pembayaran")
+    se.add_argument("--yes", action="store_true", help="lewati konfirmasi token")
+    sub.add_parser("userdata", help="pemakaian, langganan (VAS), info pelanggan")
+    by = sub.add_parser("buy", help="beli paket; default dry-run (hanya quote)")
+    by.add_argument("pvr_code", nargs="?", default="",
+                    help="kode pvr_code, ada di layar detail paket")
+    by.add_argument("--pay", action="store_true",
+                    help="lakukan pembayaran (butuh konfirmasi token)")
+    by.add_argument("--yes", action="store_true",
+                    help="lewati konfirmasi token (untuk scripting)")
+    by.add_argument("--dry-run", dest="dryrun", action="store_true",
+                    help="paksa hanya menampilkan quote")
+    rw = sub.add_parser("raw", help="panggil endpoint bebas")
+    rw.add_argument("path")
+    rw.add_argument("body", nargs="?", default="")
+    w = sub.add_parser("watch", help="pantau saldo, kuota, masa aktif + peringatan")
+    w.add_argument("--loop", action="store_true",
+                   help="pantau terus sampai Ctrl+C (default: sekali lalu keluar)")
+    w.add_argument("--interval", type=int, default=300, metavar="DETIK",
+                   help="interval cek saat --loop (default: 300)")
+    w.add_argument("--saldo-min", type=int, default=5000, metavar="RP",
+                   help="peringatan bila saldo di bawah nilai ini; 0 = matikan "
+                        "(default: 5000)")
+    w.add_argument("--kuota-min", type=int, default=10, metavar="PERSEN",
+                   help="peringatan bila sisa kuota <= N persen; -1 = matikan "
+                        "(default: 10)")
+    w.add_argument("--hari", type=int, default=3, metavar="N",
+                   help="peringatan N hari sebelum paket/masa aktif habis; "
+                        "-1 = matikan (default: 3)")
+    w.add_argument("--cooldown", type=int, default=21600, metavar="DETIK",
+                   help="jeda minimal antar notifikasi masalah yang sama "
+                        "(default: 21600 = 6 jam)")
+    w.add_argument("--force", action="store_true",
+                   help="abaikan cooldown, kirim notifikasi sekarang")
+    w.add_argument("--setup-telegram", nargs=2, metavar=("TOKEN", "CHAT_ID"),
+                   help="simpan token bot & chat id Telegram")
+    w.add_argument("--test", action="store_true",
+                   help="kirim pesan uji ke Telegram lalu keluar")
+    args = p.parse_args()
+
+    if not args.cmd:
+        interactive()
+        return
+
+    if args.cmd == "login":
+        do_login()
+        return
+
+    if args.cmd == "logout":
+        logout()
+        print(ok_msg("sesi dihapus"))
+        return
+
+    if args.cmd == "watch" and (args.setup_telegram or args.test):
+        cmd_watch_setup(args)
+        return
+
+    c = get_client()
+
+    if args.cmd == "raw":
+        cmd_raw(c, args.path, args.body)
+    elif args.cmd == "watch":
+        cmd_watch(c, args)
+    elif args.cmd == "packlist":
+        cmd_packlist(c, args.category)
+    elif args.cmd == "search":
+        cmd_search(c, args.term, buy=args.buy, pay=args.pay, yes=args.yes)
+    elif args.cmd == "buy":
+        cmd_buy(c, args.pvr_code, pay=args.pay, yes=args.yes,
+                dry_run=args.dryrun)
+    else:
+        COMMANDS[args.cmd](c)
+
+
+if __name__ == "__main__":
+    main()
