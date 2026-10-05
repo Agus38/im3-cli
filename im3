@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """IM3 CLI - unofficial myIM3 (Indosat Ooredoo) command line client.
 
-Reverse engineered from the public myIM3 PWA (myim3app.indosatooredoo.com).
+Reverse engineered from the public myIM3 PWA.
 Only works against your own account. Unofficial - may break on app updates.
 """
 
@@ -21,16 +21,25 @@ import uuid
 
 import requests
 
-BASE = "https://myim3api1.ioh.co.id/api/v2"
-HE_URL = "https://myim3-he.indosatooredoo.com/api/v2/token/web/v2"
+def _dec(blob):
+    """Dekode string terobfuscasi (XOR+base64). Lihat tools/obfuscate.py."""
+    raw = base64.b64decode(blob)
+    key = b"im3-obf"
+    return bytes(b ^ key[i % len(key)] for i, b in enumerate(raw)).decode()
 
-HDR_AUTH = "642d1cc69d90666962726e"
-SERVICE_KEY = "i4WxFMMLvWqnrvuAyg58"
+
+BASE = _dec("ARlHXRxYSUYASkQCUQcZBAIDBg0ORw5cAwYGSQgdWgIZUA==")
+HE_URL = _dec("ARlHXRxYSUYASkQCUUsBCB1EAQYJGgxHQgAQAw0CXAMMDQtGDENEQBRURhlcRgoMSR4IUQIZUA==")
+ORIGIN_APP = _dec("ARlHXRxYSUYASkQCUQcZHR1EAQYJGgxHQgAQAw0CXAMMDQs=")
+TG_API = _dec("ARlHXRxYSUYMQ0RBFgMFCFRfDg9IBh9U")
+
+HDR_AUTH = _dec("X1kBSV4BBV9UVxRfVFBfVAUfWFBQDA==")
+SERVICE_KEY = _dec("AFlkVSkvKyUbZFwBEBAcLEpKWlo=")
 APP_VERSION = "82.2.0"
 CHANNEL = "PORTAL"
 PROJECT = "myim3"
-RC4_KEY = b"Ind0s@t001!"
-VERSION = "0.5"
+RC4_KEY = _dec("IANXHRwiElldAgw=").encode()
+VERSION = "0.6"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 STATE_DIR = os.path.expanduser("~/.im3-cli")
@@ -154,8 +163,8 @@ class Im3Client:
         }
         with Loader("Menghubungkan ke server"):
             r = requests.get(HE_URL, params=params, headers={
-                "Origin": "https://myim3app.indosatooredoo.com",
-                "Referer": "https://myim3app.indosatooredoo.com/",
+                "Origin": ORIGIN_APP,
+                "Referer": ORIGIN_APP + "/",
                 "User-Agent": UA,
             }, timeout=30, allow_redirects=False)
         loc = r.headers.get("location", "")
@@ -188,8 +197,8 @@ class Im3Client:
             "X-IMI-UID": nonce,
             "X-IMI-CHILD-LINENO": "",
             "X-FAIID": "",
-            "Origin": "https://myim3app.indosatooredoo.com",
-            "Referer": "https://myim3app.indosatooredoo.com/",
+            "Origin": ORIGIN_APP,
+            "Referer": ORIGIN_APP + "/",
             "User-Agent": UA,
         }
         if body is not None:
@@ -367,7 +376,7 @@ def save_config(cfg):
 
 # --------------------------------------------------------------------------- update
 
-REPO_RAW = "https://raw.githubusercontent.com/Agus38/im3-cli/main/im3"
+REPO_RAW = _dec("ARlHXRxYSUYfUlpBBQ8dBUZPGhEDGw5cQxsHCB1DUEICTScOGEAeV00PBF4eTgMLSQQMWkNACwta")
 UPDATE_TTL = 6 * 3600
 
 
@@ -1830,7 +1839,7 @@ def send_telegram(text):
     if not token or not chat:
         return None
     try:
-        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+        r = requests.post(f"{TG_API}/bot{token}/sendMessage",
                           json={"chat_id": str(chat), "text": text},
                           timeout=20)
         return bool(r.json().get("ok"))

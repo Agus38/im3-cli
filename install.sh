@@ -1,11 +1,9 @@
 #!/bin/sh
-# Installer IM3 CLI — jalankan langsung:
-#   curl -fsSL https://raw.githubusercontent.com/Agus38/im3-cli/main/install.sh | sh
-# Hapus lagi:
-#   curl -fsSL https://raw.githubusercontent.com/Agus38/im3-cli/main/install.sh | sh -s -- --uninstall
+# Installer IM3 CLI — pakai one-liner dari README, atau: sh install.sh
+# Hapus lagi: sh install.sh --uninstall
 set -eu
 
-RAW="https://raw.githubusercontent.com/Agus38/im3-cli/main"
+RAW="$(printf '%s' 'aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL0FndXMzOC9pbTMtY2xpL21haW4=' | base64 -d)"
 NAME="im3"
 BIN_DIR="${IM3_PREFIX:-/usr/local/bin}"
 

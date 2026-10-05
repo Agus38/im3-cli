@@ -1,8 +1,15 @@
-import hashlib, json, uuid, requests
+import base64, hashlib, json, uuid, requests
 
-BASE = "https://myim3api1.ioh.co.id/api/v2"
-AUTH = "642d1cc69d90666962726e"
-SVC  = "i4WxFMMLvWqnrvuAyg58"
+def _dec(blob):
+    """Dekode string terobfuscasi (XOR+base64). Lihat tools/obfuscate.py."""
+    raw = base64.b64decode(blob)
+    key = b"im3-obf"
+    return bytes(b ^ key[i % len(key)] for i, b in enumerate(raw)).decode()
+
+BASE = _dec("ARlHXRxYSUYASkQCUQcZBAIDBg0ORw5cAwYGSQgdWgIZUA==")
+AUTH = _dec("X1kBSV4BBV9UVxRfVFBfVAUfWFBQDA==")
+SVC  = _dec("AFlkVSkvKyUbZFwBEBAcLEpKWlo=")
+ORIGIN_APP = _dec("ARlHXRxYSUYASkQCUQcZHR1EAQYJGgxHQgAQAw0CXAMMDQs=")
 VER  = "82.2.0"
 
 def odd(s): return "".join(s[i] for i in range(0, len(s), 2))
@@ -20,8 +27,8 @@ def hdr(token, msisdn=None, os_="WEB", body=None, appversion=VER):
         "X-IMI-SERVICEKEY": SVC,
         "X-DEVICEID": "web-" + uuid.uuid4().hex[:16],
         "X-DEVICENAME": "Chrome",
-        "Origin": "https://myim3app.indosatooredoo.com",
-        "Referer": "https://myim3app.indosatooredoo.com/",
+        "Origin": ORIGIN_APP,
+        "Referer": ORIGIN_APP + "/",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0 Safari/537.36",
     }
     if body is not None:

@@ -1,6 +1,13 @@
-import hashlib, json, requests
+import base64, hashlib, json, requests
 
-RC4KEY = b"Ind0s@t001!"
+def _dec(blob):
+    """Dekode string terobfuscasi (XOR+base64). Lihat tools/obfuscate.py."""
+    raw = base64.b64decode(blob)
+    key = b"im3-obf"
+    return bytes(b ^ key[i % len(key)] for i, b in enumerate(raw)).decode()
+
+RC4KEY = _dec("IANXHRwiElldAgw=").encode()
+ORIGIN_APP = _dec("ARlHXRxYSUYASkQCUQcZHR1EAQYJGgxHQgAQAw0CXAMMDQs=")
 
 def rc4(data: str) -> str:
     S = list(range(256)); K = [RC4KEY[i % 11] for i in range(256)]
@@ -16,7 +23,7 @@ def rc4(data: str) -> str:
         out.append(ch ^ S[(S[i] + S[j]) % 256])
     return out.hex()
 
-HE = "https://myim3-he.indosatooredoo.com/api/v2/token/web/v2"
+HE = _dec("ARlHXRxYSUYASkQCUUsBCB1EAQYJGgxHQgAQAw0CXAMMDQtGDENEQBRURhlcRgoMSR4IUQIZUA==")
 
 def he_token(tid, os_="WEB", device="web-" + "0" * 16, lang="ID"):
     p = {
@@ -28,8 +35,8 @@ def he_token(tid, os_="WEB", device="web-" + "0" * 16, lang="ID"):
         "pf": "myim3",
         "X-DEVICEID": rc4(device),
     }
-    r = requests.get(HE, params=p, headers={"Origin": "https://myim3app.indosatooredoo.com",
-        "Referer": "https://myim3app.indosatooredoo.com/",
+    r = requests.get(HE, params=p, headers={"Origin": ORIGIN_APP,
+        "Referer": ORIGIN_APP + "/",
         "User-Agent": "Mozilla/5.0 Chrome/120.0"}, timeout=30, allow_redirects=False)
     return r
 

@@ -3,6 +3,16 @@
 Format mengikuti [Keep a Changelog](https://keepachangelog.com). **Setiap update
 yang dirilis wajib bump versi di `VERSION` (dalam script `im3`) dan dicatat di sini.**
 
+## 0.6 — 2026-10-02
+
+### Diubah
+- **Obfuscasi string sensitif**: URL API myIM3 (endpoint, origin/referer),
+  `Authorization`/`ServiceKey`, kunci RC4, URL unduh self-update, dan URL
+  Telegram disimpan ter-encode (XOR+base64), bukan teks polos — berlaku juga
+  untuk `install.sh` (unduhan di-decode saat runtime) dan file riset
+  (`im3.py`, `im3client.py`, `probe.py`). Helper encode/decode:
+  `python3 tools/obfuscate.py enc|dec "<string>"`.
+
 ## 0.5 — 2026-10-02
 
 ### Ditambahkan

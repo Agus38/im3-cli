@@ -113,4 +113,7 @@ Peringatan yang sama tidak dikirim ulang sebelum cooldown (default 6 jam);
 - Sumber: satu file `im3` (script Python executable).
 - **Setiap update wajib bump `VERSION`** di bagian atas script dan menambah
   entri baru di [CHANGELOG.md](CHANGELOG.md).
+- String sensitif (URL API, header, kunci) disimpan terobfuscasi (XOR+base64),
+  bukan teks polos. Encode/decode saat mengembangkan:
+  `python3 tools/obfuscate.py enc|dec "<string>"`.
 - Cek cepat: `python3 -m py_compile im3 && ./im3 --version`

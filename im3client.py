@@ -6,15 +6,24 @@ import uuid
 
 import requests
 
-BASE = "https://myim3api1.ioh.co.id/api/v2"
-HE = "https://myim3-he.indosatooredoo.com/api/v2/token/web/v2"
 
-HDR_AUTH = "642d1cc69d90666962726e"
-SERVICE_KEY = "i4WxFMMLvWqnrvuAyg58"
+def _dec(blob):
+    """Dekode string terobfuscasi (XOR+base64). Lihat tools/obfuscate.py."""
+    raw = base64.b64decode(blob)
+    key = b"im3-obf"
+    return bytes(b ^ key[i % len(key)] for i, b in enumerate(raw)).decode()
+
+
+BASE = _dec("ARlHXRxYSUYASkQCUQcZBAIDBg0ORw5cAwYGSQgdWgIZUA==")
+HE = _dec("ARlHXRxYSUYASkQCUUsBCB1EAQYJGgxHQgAQAw0CXAMMDQtGDENEQBRURhlcRgoMSR4IUQIZUA==")
+ORIGIN_APP = _dec("ARlHXRxYSUYASkQCUQcZHR1EAQYJGgxHQgAQAw0CXAMMDQs=")
+
+HDR_AUTH = _dec("X1kBSV4BBV9UVxRfVFBfVAUfWFBQDA==")
+SERVICE_KEY = _dec("AFlkVSkvKyUbZFwBEBAcLEpKWlo=")
 APP_VERSION = "82.2.0"
 CHANNEL = "PORTAL"
 PROJECT = "myim3"
-RC4_KEY = b"Ind0s@t001!"
+RC4_KEY = _dec("IANXHRwiElldAgw=").encode()
 
 
 def rc4(data: str) -> str:
@@ -39,7 +48,7 @@ def odd_chars(s: str) -> str:
 
 
 def guest_token(device: str = None) -> dict:
-    """Guest token flow via myim3-he. Returns dict with tid, jwt, network, userclass."""
+    """Guest token flow. Returns dict with tid, jwt, network, userclass."""
     device = device or uuid.uuid4().hex
     tid = str(int(time.time() * 1000))
     params = {
@@ -55,8 +64,8 @@ def guest_token(device: str = None) -> dict:
         HE,
         params=params,
         headers={
-            "Origin": "https://myim3app.indosatooredoo.com",
-            "Referer": "https://myim3app.indosatooredoo.com/",
+            "Origin": ORIGIN_APP,
+            "Referer": ORIGIN_APP + "/",
             "User-Agent": UA,
         },
         timeout=30,
@@ -96,8 +105,8 @@ class Im3:
             "X-IMI-SERVICEKEY": SERVICE_KEY,
             "X-DEVICEID": self.device,
             "X-DEVICENAME": "WEB",
-            "Origin": "https://myim3app.indosatooredoo.com",
-            "Referer": "https://myim3app.indosatooredoo.com/",
+            "Origin": ORIGIN_APP,
+            "Referer": ORIGIN_APP + "/",
             "User-Agent": UA,
         }
         if body is not None:
